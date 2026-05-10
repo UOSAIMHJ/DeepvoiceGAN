@@ -1,0 +1,345 @@
+from google.colab import files
+uploaded = files.upload()
+
+import zipfile
+import os
+
+zip_path = 'data.zip'
+extract_path = './dataset'
+
+with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+
+print('압축 해제 완료')
+
+import os
+import librosa
+import soundfile as sf
+import noisereduce as nr
+from pydub import AudioSegment
+from tqdm import tqdm
+
+TARGET_SR = 16000
+TARGET_DURATION = 5
+TARGET_LENGTH = TARGET_SR * TARGET_DURATION
+
+input_root = './dataset'
+output_root = './processed'
+os.makedirs(output_root, exist_ok=True)
+
+
+def convert_audio(file_path):
+    ext = file_path.split('.')[-1].lower()
+
+    if ext in ['mp3', 'm4a']:
+        audio = AudioSegment.from_file(file_path)
+        wav_path = file_path.rsplit('.', 1)[0] + '.wav'
+        audio.export(wav_path, format='wav')
+        return wav_path
+
+    return file_path
+
+
+def preprocess_audio(file_path, save_path):
+    y, sr = librosa.load(file_path, sr=TARGET_SR)
+
+    reduced = nr.reduce_noise(y=y, sr=sr)
+
+    if len(reduced) > TARGET_LENGTH:
+        reduced = reduced[:TARGET_LENGTH]
+    else:
+        pad = TARGET_LENGTH - len(reduced)
+        reduced = librosa.util.fix_length(reduced, size=TARGET_LENGTH)
+
+    reduced = librosa.util.normalize(reduced)
+
+    sf.write(save_path, reduced, TARGET_SR)
+
+
+for cls in ['real', 'phishing']:
+    input_dir = os.path.join(input_root, cls)
+    save_dir = os.path.join(output_root, cls)
+    os.makedirs(save_dir, exist_ok=True)
+
+    for f in tqdm(os.listdir(input_dir)):
+        src = os.path.join(input_dir, f)
+        src = convert_audio(src)
+
+        save_path = os.path.join(save_dir, f.split('.')[0] + '.wav')
+        preprocess_audio(src, save_path)
+
+print('전처리 완료')
+
+import numpy as np
+
+
+def extract_features(path):
+    y, sr = librosa.load(path, sr=16000)
+
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+    mel = librosa.feature.melspectrogram(y=y, sr=sr)
+
+    mfcc = librosa.util.normalize(mfcc)
+    mel = librosa.power_to_db(mel)
+
+    feature = np.concatenate([mfcc, mel], axis=0)
+
+    return feature
+
+import torch
+import torch.nn as nn
+
+class WaveGANGenerator(nn.Module):
+    def __init__(self, latent_dim=100):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.ConvTranspose1d(latent_dim, 512, 25, 4),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+
+            nn.ConvTranspose1d(512, 256, 25, 4),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+
+            nn.ConvTranspose1d(256, 128, 25, 4),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+
+            nn.ConvTranspose1d(128, 1, 25, 4),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        return self.model(z)
+
+from torch.nn.utils import spectral_norm
+
+class Critic(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            spectral_norm(nn.Conv1d(1, 64, 25, 4)),
+            nn.LeakyReLU(0.2),
+
+            spectral_norm(nn.Conv1d(64, 128, 25, 4)),
+            nn.LeakyReLU(0.2),
+
+            spectral_norm(nn.Conv1d(128, 256, 25, 4)),
+            nn.LeakyReLU(0.2),
+
+            nn.Flatten(),
+            nn.Linear(2560, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def gradient_penalty(critic, real, fake, device):
+    batch_size = real.shape[0]
+
+    epsilon = torch.rand(batch_size, 1, 1).to(device)
+    interpolated = real * epsilon + fake * (1 - epsilon)
+
+    mixed_scores = critic(interpolated)
+
+    gradient = torch.autograd.grad(
+        inputs=interpolated,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+
+    gradient = gradient.view(gradient.shape[0], -1)
+    norm = gradient.norm(2, dim=1)
+
+    return torch.mean((norm - 1) ** 2)
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+class VoiceDataset(Dataset):
+    def __init__(self, root_dir):
+        self.samples = []
+
+        for label, cls in enumerate(['real', 'phishing']):
+            folder = os.path.join(root_dir, cls)
+
+            for file in os.listdir(folder):
+                path = os.path.join(folder, file)
+                self.samples.append((path, label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+
+        y, sr = librosa.load(path, sr=16000)
+        y = librosa.util.normalize(y)
+
+        y = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
+
+        return y, torch.tensor(label, dtype=torch.long)
+
+train_dataset = VoiceDataset('./processed')
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=16,
+    shuffle=True,
+    drop_last=True
+)
+
+class VoiceClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            spectral_norm(nn.Conv1d(1, 32, 5, 2)),
+            nn.ReLU(),
+
+            spectral_norm(nn.Conv1d(32, 64, 5, 2)),
+            nn.ReLU(),
+
+            spectral_norm(nn.Conv1d(64, 128, 5, 2)),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(128, 2)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+import torch.optim as optim
+from tqdm import tqdm
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+LATENT_DIM = 100
+EPOCHS = 50
+LAMBDA_GP = 10
+
+G = WaveGANGenerator().to(DEVICE)
+C = Critic().to(DEVICE)
+Classifier = VoiceClassifier().to(DEVICE)
+
+opt_G = optim.Adam(G.parameters(), lr=1e-4, betas=(0.0, 0.9))
+opt_C = optim.Adam(C.parameters(), lr=1e-4, betas=(0.0, 0.9))
+opt_cls = optim.Adam(Classifier.parameters(), lr=1e-4)
+
+criterion = nn.CrossEntropyLoss()
+
+critic_losses = []
+generator_losses = []
+classifier_losses = []
+
+for epoch in range(EPOCHS):
+    loop = tqdm(train_loader)
+
+    for real, labels in loop:
+        real = real.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        batch_size = real.shape[0]
+
+        # Critic update
+        z = torch.randn(batch_size, LATENT_DIM, 1).to(DEVICE)
+        fake = G(z)
+
+        critic_real = C(real).reshape(-1)
+        critic_fake = C(fake.detach()).reshape(-1)
+
+        gp = gradient_penalty(C, real, fake, DEVICE)
+
+        loss_C = (
+            -(torch.mean(critic_real) - torch.mean(critic_fake))
+            + LAMBDA_GP * gp
+        )
+
+        opt_C.zero_grad()
+        loss_C.backward(retain_graph=True)
+        opt_C.step()
+
+        # Generator update
+        gen_fake = C(fake).reshape(-1)
+        loss_G = -torch.mean(gen_fake)
+
+        opt_G.zero_grad()
+        loss_G.backward(retain_graph=True)
+        opt_G.step()
+
+        # Classifier update
+        pred = Classifier(real)
+        cls_loss = criterion(pred, labels)
+
+        opt_cls.zero_grad()
+        cls_loss.backward()
+        opt_cls.step()
+
+        loop.set_description(f'Epoch [{epoch+1}/{EPOCHS}]')
+        loop.set_postfix(
+            critic_loss=float(loss_C),
+            generator_loss=float(loss_G),
+            classifier_loss=float(cls_loss)
+        )
+
+    critic_losses.append(float(loss_C))
+    generator_losses.append(float(loss_G))
+    classifier_losses.append(float(cls_loss))
+
+print('학습 완료')
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8,5))
+plt.plot(critic_losses, label='Critic Loss')
+plt.plot(generator_losses, label='Generator Loss')
+plt.plot(classifier_losses, label='Classifier Loss')
+plt.legend()
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss')
+plt.show()
+
+os.makedirs('./checkpoints', exist_ok=True)
+
+torch.save(Classifier.state_dict(), './checkpoints/voice_model.pth')
+print('모델 저장 완료')
+
+import torch.nn.functional as F
+
+model = VoiceClassifier().to(DEVICE)
+model.load_state_dict(torch.load('./checkpoints/voice_model.pth'))
+model.eval()
+
+
+def predict_voice(file_path):
+    y, sr = librosa.load(file_path, sr=16000)
+
+    y = librosa.util.fix_length(y, size=16000 * 5)
+    y = librosa.util.normalize(y)
+
+    x = torch.tensor(y, dtype=torch.float32)
+    x = x.unsqueeze(0).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        logits = model(x)
+        probs = F.softmax(logits, dim=1)
+
+    phishing_prob = probs[0][1].item() * 100
+
+    if phishing_prob >= 70:
+        result = '위험'
+    elif phishing_prob >= 40:
+        result = '주의'
+    else:
+        result = '안전'
+
+    print(f'보이스피싱 의심 확률: {phishing_prob:.2f}%')
+    print(f'판정: {result}')
+
+
+predict_voice('sample.wav')
